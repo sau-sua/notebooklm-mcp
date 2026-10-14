@@ -26,6 +26,7 @@ export const LEGACY_TO_CANONICAL: Record<string, string> = {
   get_library_stats: 'library_stats',
   // notebook_* — operations directly against NotebookLM
   ask_question: 'notebook_ask',
+  ask_question_result: 'notebook_ask_result',
   create_notebook: 'notebook_create',
   delete_notebooks_from_nblm: 'notebook_delete',
   list_notebooks_from_nblm: 'notebook_list',

@@ -66,6 +66,59 @@ const sessionManager = new SessionManager(authManager);
 const library = new NotebookLibrary(sessionManager);
 const toolHandlers = new ToolHandlers(sessionManager, authManager, library);
 
+type AskJobStatus = 'pending' | 'done' | 'error';
+
+interface AskJob {
+  id: string;
+  status: AskJobStatus;
+  createdAt: number;
+  finishedAt?: number;
+  result?: unknown;
+  error?: string;
+}
+
+const askJobs = new Map<string, AskJob>();
+const ASK_POLL_WAIT_MS = 40_000;
+const ASK_JOB_TTL_MS = 15 * 60 * 1000;
+const ASK_JOB_MAX_DONE = 20;
+const ASK_JOB_RUN_LIMIT_MS = 5 * 60 * 1000;
+
+function pruneAskJobs(now = Date.now()): void {
+  for (const job of askJobs.values()) {
+    if (job.status === 'pending' && now - job.createdAt > ASK_JOB_RUN_LIMIT_MS) {
+      job.status = 'error';
+      job.error = 'timed out after 5 minutes';
+      job.finishedAt = now;
+    }
+  }
+  for (const [id, job] of askJobs) {
+    if (
+      job.status !== 'pending' &&
+      job.finishedAt !== undefined &&
+      now - job.finishedAt > ASK_JOB_TTL_MS
+    ) {
+      askJobs.delete(id);
+    }
+  }
+  const finished = [...askJobs.entries()]
+    .filter(([, job]) => job.status !== 'pending')
+    .sort((a, b) => (a[1].finishedAt ?? 0) - (b[1].finishedAt ?? 0));
+  while (finished.length > ASK_JOB_MAX_DONE) {
+    const oldest = finished.shift();
+    if (oldest) askJobs.delete(oldest[0]);
+  }
+}
+
+function askJobView(job: AskJob): Record<string, unknown> {
+  if (job.status === 'pending') return { job_id: job.id, status: 'pending' };
+  if (job.status === 'error') {
+    return { job_id: job.id, status: 'error', error: job.error ?? 'error' };
+  }
+  return { job_id: job.id, status: 'done', result: job.result };
+}
+
+setInterval(() => pruneAskJobs(), 30_000).unref();
+
 // Root endpoint - API info
 app.get('/', (_req: Request, res: Response) => {
   res.json({
@@ -78,6 +131,8 @@ app.get('/', (_req: Request, res: Response) => {
     endpoints: {
       health: 'GET /health',
       ask: 'POST /ask',
+      asks: 'POST /asks',
+      ask_result: 'GET /asks/:id',
       batch_to_vault: 'POST /batch-to-vault',
       setup_auth: 'POST /setup-auth',
       notebooks: 'GET /notebooks',
@@ -133,6 +188,68 @@ app.post('/ask', async (req: Request, res: Response) => {
       error: error instanceof Error ? error.message : String(error),
     });
   }
+});
+
+app.post('/asks', (req: Request, res: Response) => {
+  const reqId = req.requestId.substring(0, 8);
+  const { question, session_id, notebook_id, notebook_url, show_browser, source_format } = req.body;
+
+  if (!question) {
+    log.warning(`[${reqId}] /asks - Missing question`);
+    res.status(400).json({ success: false, error: 'Missing required field: question' });
+    return;
+  }
+
+  pruneAskJobs();
+  const job: AskJob = { id: randomUUID(), status: 'pending', createdAt: Date.now() };
+  askJobs.set(job.id, job);
+
+  void toolHandlers
+    .handleAskQuestion(
+      { question, session_id, notebook_id, notebook_url, show_browser, source_format },
+      async (message, progress, total) => {
+        log.info(`[${reqId}] Progress: ${message} (${progress}/${total})`);
+      }
+    )
+    .then((result) => {
+      if (job.status !== 'pending') return;
+      job.status = 'done';
+      job.result = result;
+      job.finishedAt = Date.now();
+      log.success(`[${reqId}] /asks ${job.id} - Completed`);
+    })
+    .catch((error: unknown) => {
+      if (job.status !== 'pending') return;
+      job.status = 'error';
+      job.error = error instanceof Error ? error.message : String(error);
+      job.finishedAt = Date.now();
+      log.error(`[${reqId}] /asks ${job.id} - Error: ${job.error}`);
+    });
+
+  res.status(202).json({ job_id: job.id, status: 'pending' });
+});
+
+app.get('/asks/:id', async (req: Request, res: Response) => {
+  const jobId = String(req.params.id);
+  const deadline = Date.now() + ASK_POLL_WAIT_MS;
+  let job = askJobs.get(jobId);
+  if (!job) {
+    res.json({ job_id: jobId, status: 'error', error: 'job not found' });
+    return;
+  }
+
+  while (job.status === 'pending' && Date.now() < deadline) {
+    pruneAskJobs();
+    job = askJobs.get(jobId);
+    if (!job || job.status !== 'pending') break;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+
+  if (!job) {
+    res.json({ job_id: jobId, status: 'error', error: 'job not found' });
+    return;
+  }
+  res.json(askJobView(job));
 });
 
 // Batch-to-vault — run a list of questions and persist each answer as

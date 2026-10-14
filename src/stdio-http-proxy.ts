@@ -126,11 +126,10 @@ function buildProxyToolDefinitions(): Tool[] {
     {
       name: 'ask_question',
       description:
-        '🔌 [PROXY MODE] Ask NotebookLM via HTTP server.\n\n' +
-        'This tool proxies requests to the HTTP server at ' +
-        HTTP_BASE_URL +
-        '\n' +
-        'Ensure the HTTP server is running: npm run start:http\n\n' +
+        '🔌 [PROXY MODE] Start a NotebookLM question and return immediately.\n\n' +
+        'Returns job_id and status pending. This result has no answer.\n' +
+        'Call notebook_ask_result with that job_id until status is done or error.\n' +
+        'pending is not an error. Calling this tool again sends a new question.\n\n' +
         'Parameters:\n' +
         '- question (required): The question to ask\n' +
         '- notebook_id: Library notebook ID\n' +
@@ -154,6 +153,22 @@ function buildProxyToolDefinitions(): Tool[] {
           },
         },
         required: ['question'],
+      },
+    },
+    {
+      name: 'ask_question_result',
+      description:
+        '🔌 [PROXY MODE] Poll a NotebookLM question started by notebook_ask.\n\n' +
+        'Pass job_id. Waits up to 40 seconds.\n' +
+        'status pending: call this tool again with the same job_id.\n' +
+        'status done: read result. status error: read error.\n' +
+        'pending is not an error and does not ask NotebookLM again.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          job_id: { type: 'string', description: 'job_id returned by notebook_ask' },
+        },
+        required: ['job_id'],
       },
     },
     {
@@ -414,7 +429,56 @@ function buildProxyToolDefinitions(): Tool[] {
         },
       },
     },
+    {
+      name: 'list_sources',
+      description:
+        '🔌 [PROXY] List the sources of a NotebookLM notebook (id and title) via the HTTP server.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          notebook_url: { type: 'string', description: 'Notebook URL' },
+          notebook_id: { type: 'string', description: 'Notebook UUID, or a library notebook id' },
+        },
+      },
+    },
+    {
+      name: 'read_source',
+      description:
+        '🔌 [PROXY] Read a source’s indexed text via the HTTP server. Identify it by source_id or source_name.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          source_id: { type: 'string', description: 'Source id from list_sources' },
+          source_name: { type: 'string', description: 'Source title (partial match)' },
+          notebook_url: { type: 'string', description: 'Notebook URL' },
+          notebook_id: { type: 'string', description: 'Notebook UUID, or a library notebook id' },
+          format: { type: 'string', enum: ['text', 'html'], description: 'text (default) or html' },
+          paginate: { type: 'boolean', description: 'Return one page at a time (default true)' },
+          max_chars: { type: 'number', description: 'Page size in characters' },
+          cursor: { type: 'number', description: 'Offset from a previous page' },
+        },
+      },
+    },
   ];
+}
+
+/** NotebookLM UUID from a URL, a raw id, or a library notebook record. */
+async function resolveNotebookUuid(args: Record<string, unknown>): Promise<string> {
+  const blob = `${args.notebook_url || ''} ${args.notebook_id || ''}`;
+  const inline = blob.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
+  if (inline) return inline[0];
+
+  if (args.notebook_id) {
+    const record = await httpRequest<{ data?: { url?: string }; url?: string }>(
+      'GET',
+      `/notebooks/${encodeURIComponent(String(args.notebook_id))}`
+    );
+    const url = String(record?.data?.url || record?.url || '');
+    const fromLibrary = url.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
+    if (fromLibrary) return fromLibrary[0];
+  }
+
+  throw new Error('notebook_url or notebook_id is required');
 }
 
 /** Tool definitions advertised over stdio — canonical v2 names. */
@@ -438,7 +502,15 @@ async function handleToolCall(
     switch (name) {
       // Query endpoints
       case 'ask_question':
-        return await httpRequest('POST', '/ask', args);
+        return await httpRequest('POST', '/asks', args);
+
+      case 'ask_question_result': {
+        const jobId = args.job_id;
+        if (typeof jobId !== 'string' || jobId.length === 0) {
+          return { success: false, error: 'Missing required field: job_id' };
+        }
+        return await httpRequest('GET', `/asks/${encodeURIComponent(jobId)}`);
+      }
 
       case 'get_health':
         return await httpRequest('GET', '/health');
@@ -553,6 +625,59 @@ async function handleToolCall(
         return await httpRequest(
           'GET',
           `/content/audio/download${downloadQuery ? `?${downloadQuery}` : ''}`
+        );
+      }
+
+      case 'list_sources': {
+        const notebookId = await resolveNotebookUuid(args);
+        return await httpRequest('GET', `/notebooks/${notebookId}/sources`);
+      }
+
+      case 'read_source': {
+        const notebookId = await resolveNotebookUuid(args);
+        let sourceId = args.source_id ? String(args.source_id) : '';
+        if (!sourceId && args.source_name) {
+          const listed = await httpRequest<{
+            data?: { sources?: Array<{ id?: string; title?: string }> };
+            sources?: Array<{ id?: string; title?: string }>;
+          }>('GET', `/notebooks/${notebookId}/sources`);
+          const sources = (listed?.data?.sources || listed?.sources || []) as Array<{
+            id?: string;
+            title?: string;
+          }>;
+          const needle = String(args.source_name).toLowerCase();
+          const matches = sources.filter((source) =>
+            String(source.title || '')
+              .toLowerCase()
+              .includes(needle)
+          );
+          if (matches.length === 0) {
+            return { success: false, error: `No source matching "${args.source_name}"` };
+          }
+          if (matches.length > 1) {
+            const titles = matches
+              .slice(0, 5)
+              .map((source) => source.title)
+              .join(', ');
+            return {
+              success: false,
+              error: `"${args.source_name}" matches ${matches.length} sources (${titles}) — pass source_id`,
+            };
+          }
+          sourceId = String(matches[0].id);
+        }
+        if (!sourceId) {
+          return { success: false, error: 'Either source_id or source_name is required' };
+        }
+        const query = new URLSearchParams();
+        if (args.format) query.set('format', String(args.format));
+        if (args.paginate === false) query.set('paginate', 'false');
+        if (args.max_chars !== undefined) query.set('max_chars', String(args.max_chars));
+        if (args.cursor !== undefined) query.set('cursor', String(args.cursor));
+        const qs = query.toString();
+        return await httpRequest(
+          'GET',
+          `/notebooks/${notebookId}/sources/${encodeURIComponent(sourceId)}${qs ? `?${qs}` : ''}`
         );
       }
 
@@ -684,7 +809,6 @@ class StdioHttpProxyServer {
 
       // Tools that can take a long time (browser interactions)
       const longRunningTools = new Set([
-        'ask_question',
         'setup_auth',
         're_auth',
         'generate_audio',
