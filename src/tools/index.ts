@@ -215,6 +215,12 @@ const TOOL_ANNOTATIONS: Record<string, NonNullable<Tool['annotations']>> = {
     idempotentHint: false,
     openWorldHint: true,
   },
+  ask_question_result: {
+    title: 'Get the answer to an asked question',
+    readOnlyHint: true,
+    idempotentHint: true,
+    openWorldHint: false,
+  },
   auto_discover_notebook: {
     title: 'Auto-discover notebook metadata',
     readOnlyHint: false,
@@ -442,14 +448,49 @@ const TOOL_RESULT_OUTPUT_SCHEMA: NonNullable<Tool['outputSchema']> = {
   required: ['success'],
 };
 
+export interface ToolDefinitionOptions {
+  /**
+   * Advertise the job-based ask: `notebook_ask` returns a job id at once and
+   * `notebook_ask_result` polls for the answer. Used where a client's
+   * tool-call timeout is shorter than NotebookLM takes to answer.
+   */
+  asyncAsk?: boolean;
+}
+
+const ASYNC_ASK_PREAMBLE =
+  'Starts a NotebookLM question and returns immediately with job_id and status pending. ' +
+  'That result has no answer yet: call notebook_ask_result with the job_id until status ' +
+  'is done or error. pending is not an error. Calling notebook_ask again sends a new question.\n\n';
+
+const ASK_RESULT_DEFINITION: Tool = {
+  name: 'ask_question_result',
+  description:
+    'Get the answer to a question started by notebook_ask. Pass its job_id. ' +
+    'Waits up to ~40 seconds for the answer.\n' +
+    '- status pending: call this tool again with the same job_id (it does not ask NotebookLM again).\n' +
+    '- status done: the answer is in data.result.\n' +
+    '- status error: read error. If the job was not found, ask the question again.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      job_id: { type: 'string', description: 'job_id returned by notebook_ask' },
+    },
+    required: ['job_id'],
+  },
+};
+
 /**
  * Build Tool Definitions with NotebookLibrary context
  */
-export function buildToolDefinitions(library: NotebookLibrary): Tool[] {
+export function buildToolDefinitions(
+  library: NotebookLibrary,
+  options: ToolDefinitionOptions = {}
+): Tool[] {
   const defs: Tool[] = [
     {
       name: 'ask_question',
-      description: buildAskQuestionDescription(library),
+      description:
+        (options.asyncAsk ? ASYNC_ASK_PREAMBLE : '') + buildAskQuestionDescription(library),
       inputSchema: {
         type: 'object',
         properties: {
@@ -1819,6 +1860,10 @@ User: "Yes" → call remove_notebook`,
       },
     },
   ];
+
+  if (options.asyncAsk) {
+    defs.splice(1, 0, ASK_RESULT_DEFINITION);
+  }
 
   // Rename to canonical (v2) names and attach the shared output
   // schema + behaviour hints. Annotation lookup uses the legacy name, which is

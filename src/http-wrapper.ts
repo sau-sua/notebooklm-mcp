@@ -16,6 +16,9 @@ import { AuthManager } from './auth/auth-manager.js';
 import { SessionManager } from './session/session-manager.js';
 import { NotebookLibrary } from './library/notebook-library.js';
 import { ToolHandlers } from './tools/index.js';
+import { createMcpServer } from './mcp/create-server.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 import { AutoDiscovery } from './auto-discovery/auto-discovery.js';
 import { StartupManager } from './startup/startup-manager.js';
 import { isNotebookHost } from './utils/notebook-domain.js';
@@ -119,6 +122,47 @@ function askJobView(job: AskJob): Record<string, unknown> {
 
 setInterval(() => pruneAskJobs(), 30_000).unref();
 
+function startAskJob(
+  args: Parameters<ToolHandlers['handleAskQuestion']>[0],
+  reqId: string
+): AskJob {
+  pruneAskJobs();
+  const job: AskJob = { id: randomUUID(), status: 'pending', createdAt: Date.now() };
+  askJobs.set(job.id, job);
+
+  void toolHandlers
+    .handleAskQuestion(args, async (message, progress, total) => {
+      log.info(`[${reqId}] Progress: ${message} (${progress}/${total})`);
+    })
+    .then((result) => {
+      if (job.status !== 'pending') return;
+      job.status = 'done';
+      job.result = result;
+      job.finishedAt = Date.now();
+      log.success(`[${reqId}] /asks ${job.id} - Completed`);
+    })
+    .catch((error: unknown) => {
+      if (job.status !== 'pending') return;
+      job.status = 'error';
+      job.error = error instanceof Error ? error.message : String(error);
+      job.finishedAt = Date.now();
+      log.error(`[${reqId}] /asks ${job.id} - Error: ${job.error}`);
+    });
+
+  return job;
+}
+
+async function waitAskJob(jobId: string): Promise<Record<string, unknown>> {
+  const deadline = Date.now() + ASK_POLL_WAIT_MS;
+  let job = askJobs.get(jobId);
+  while (job?.status === 'pending' && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    pruneAskJobs();
+    job = askJobs.get(jobId);
+  }
+  return job ? askJobView(job) : { job_id: jobId, status: 'error', error: 'job not found' };
+}
+
 // Root endpoint - API info
 app.get('/', (_req: Request, res: Response) => {
   res.json({
@@ -133,6 +177,7 @@ app.get('/', (_req: Request, res: Response) => {
       ask: 'POST /ask',
       asks: 'POST /asks',
       ask_result: 'GET /asks/:id',
+      mcp: 'POST /mcp (MCP Streamable HTTP)',
       batch_to_vault: 'POST /batch-to-vault',
       setup_auth: 'POST /setup-auth',
       notebooks: 'GET /notebooks',
@@ -200,56 +245,86 @@ app.post('/asks', (req: Request, res: Response) => {
     return;
   }
 
-  pruneAskJobs();
-  const job: AskJob = { id: randomUUID(), status: 'pending', createdAt: Date.now() };
-  askJobs.set(job.id, job);
-
-  void toolHandlers
-    .handleAskQuestion(
-      { question, session_id, notebook_id, notebook_url, show_browser, source_format },
-      async (message, progress, total) => {
-        log.info(`[${reqId}] Progress: ${message} (${progress}/${total})`);
-      }
-    )
-    .then((result) => {
-      if (job.status !== 'pending') return;
-      job.status = 'done';
-      job.result = result;
-      job.finishedAt = Date.now();
-      log.success(`[${reqId}] /asks ${job.id} - Completed`);
-    })
-    .catch((error: unknown) => {
-      if (job.status !== 'pending') return;
-      job.status = 'error';
-      job.error = error instanceof Error ? error.message : String(error);
-      job.finishedAt = Date.now();
-      log.error(`[${reqId}] /asks ${job.id} - Error: ${job.error}`);
-    });
-
+  const job = startAskJob(
+    { question, session_id, notebook_id, notebook_url, show_browser, source_format },
+    reqId
+  );
   res.status(202).json({ job_id: job.id, status: 'pending' });
 });
 
 app.get('/asks/:id', async (req: Request, res: Response) => {
-  const jobId = String(req.params.id);
-  const deadline = Date.now() + ASK_POLL_WAIT_MS;
-  let job = askJobs.get(jobId);
-  if (!job) {
-    res.json({ job_id: jobId, status: 'error', error: 'job not found' });
-    return;
-  }
+  res.json(await waitAskJob(String(req.params.id)));
+});
 
-  while (job.status === 'pending' && Date.now() < deadline) {
-    pruneAskJobs();
-    job = askJobs.get(jobId);
-    if (!job || job.status !== 'pending') break;
-    await new Promise((resolve) => setTimeout(resolve, 250));
-  }
+// MCP over Streamable HTTP: one MCP server per client session, sharing the
+// managers above. notebook_ask runs as an /asks job and notebook_ask_result
+// polls it, so no tool call outlives the client's tool timeout.
+const MCP_SESSION_IDLE_MS = 30 * 60 * 1000;
+const mcpSessions = new Map<
+  string,
+  { transport: StreamableHTTPServerTransport; lastSeenAt: number }
+>();
 
-  if (!job) {
-    res.json({ job_id: jobId, status: 'error', error: 'job not found' });
-    return;
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, session] of mcpSessions) {
+    if (now - session.lastSeenAt > MCP_SESSION_IDLE_MS) {
+      mcpSessions.delete(id);
+      void session.transport.close();
+    }
   }
-  res.json(askJobView(job));
+}, 60_000).unref();
+
+app.all('/mcp', async (req: Request, res: Response) => {
+  try {
+    const sessionId = req.headers['mcp-session-id'] as string | undefined;
+    const session = sessionId ? mcpSessions.get(sessionId) : undefined;
+    if (session) {
+      session.lastSeenAt = Date.now();
+      await session.transport.handleRequest(req, res, req.body);
+      return;
+    }
+    if (sessionId || req.method !== 'POST' || !isInitializeRequest(req.body)) {
+      res.status(sessionId ? 404 : 400).json({
+        jsonrpc: '2.0',
+        error: { code: -32000, message: sessionId ? 'Session not found' : 'No valid session' },
+        id: null,
+      });
+      return;
+    }
+
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: () => randomUUID(),
+      onsessioninitialized: (id) => {
+        mcpSessions.set(id, { transport, lastSeenAt: Date.now() });
+      },
+    });
+    transport.onclose = () => {
+      if (transport.sessionId) mcpSessions.delete(transport.sessionId);
+    };
+    const server = createMcpServer(
+      {
+        toolHandlers,
+        library,
+        asyncAsk: {
+          start: (args) => startAskJob(args, 'mcp').id,
+          result: waitAskJob,
+        },
+      },
+      SERVER_VERSION
+    );
+    await server.connect(transport);
+    await transport.handleRequest(req, res, req.body);
+  } catch (error) {
+    log.error(`/mcp - Error: ${error instanceof Error ? error.message : String(error)}`);
+    if (!res.headersSent) {
+      res.status(500).json({
+        jsonrpc: '2.0',
+        error: { code: -32603, message: 'Internal server error' },
+        id: null,
+      });
+    }
+  }
 });
 
 // Batch-to-vault — run a list of questions and persist each answer as
@@ -1607,6 +1682,7 @@ async function startServer(port: number, host: string): Promise<void> {
   log.info('📊 Quick Links:');
   log.info(`   Health check: http://localhost:${PORT}/health`);
   log.info(`   API endpoint: http://localhost:${PORT}/ask`);
+  log.info(`   MCP endpoint: http://localhost:${PORT}/mcp`);
   log.info('');
   log.info('📖 Available Endpoints:');
   log.info('   Authentication:');

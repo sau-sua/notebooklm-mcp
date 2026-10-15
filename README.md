@@ -208,6 +208,17 @@ claude mcp add notebooklm node /path/to/notebooklm-mcp/dist/index.js
 }
 ```
 
+**Or connect by URL** to a running HTTP server (`npm run start:http`), which serves
+MCP over Streamable HTTP on `/mcp` — no process per client, one shared Chrome:
+
+```bash
+claude mcp add --transport http notebooklm http://127.0.0.1:3000/mcp
+```
+
+Over HTTP, `notebook_ask` returns a `job_id` and `notebook_ask_result` polls it
+(up to 40 s per call) until the answer is ready. There is no authentication on
+`/mcp`: keep the server on a private interface (`HTTP_HOST=127.0.0.1`).
+
 **Log in once — in a terminal, not through the assistant.** Run the interactive
 Google login as a command; a visible Chrome window opens, you sign in, and the
 saved session is then reused by the MCP server:
